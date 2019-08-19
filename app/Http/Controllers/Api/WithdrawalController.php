@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use GuzzleHttp\Client;
+use GatewayClient\Gateway;
 use App\Http\Resources\WithdrawalResource;
 use App\Models\Withdrawal;
 use App\Models\PunchCard;
@@ -33,9 +34,9 @@ class WithdrawalController extends ApiController
         $sign = $request->query('sign');    // 签名串
         $time = $request->query('time');    // 时间戳
         $json = $request->getContent();     // json请求体
-        //$json = str_replace(' ','',$json);  // 删除curl测试请求产生的空白字符
+//        $json = str_replace(' ','',$json);  // 删除curl测试请求产生的空白字符
 //        $json = '{
-//                    "merchant_id": "A0001",
+//                    "merchant_id": "5d49145f1d008",
 //                     "order_id": "'.time().'",
 //                     "notify_url": "http://self.example.com/callback_url",
 //                     "bill_price": "100.55",
@@ -71,7 +72,7 @@ class WithdrawalController extends ApiController
         {
             return response()->json(['status'=>10106,'message'=>'签名错误','flashid'=>$merchant_order_id]);
         }
-        $service_id = 0; // 接收人为0 表示没有客服收到信息
+        $service_id = '0'; // 接收人为0 表示没有客服收到信息
         $todayStart = Carbon::today()->toDateTimeString();
         // 当前上班的客服
         $onServiceIds = WithdrawalServiceTime::where('status', 1)->where('on_time', '>=', $todayStart)->get(['service_id']);
@@ -79,12 +80,33 @@ class WithdrawalController extends ApiController
         {
             foreach ($onServiceIds as $one)
             {
-                $aServiceIds[] = $one->service_id;
+                $aServiceIds[] = $one->service_id;      // 当前上班的客服
             }
-            $service_id = array_random($aServiceIds); // 随机分配一个上班的客服
+            //有分配订单的客服
+            $oRes = Withdrawal::select(DB::raw('service_id, count(*) as nums'))
+                                        ->whereIn('service_id', $aServiceIds)
+                                        ->where('status', '<=',  Withdrawal::STATUS_HOLDING)
+                                        ->where('created_at', '>=', $todayStart)
+                                        ->groupBy('service_id')
+                                        ->orderBy('nums','ASC')
+                                        ->get();
+            if($oRes->isNotEmpty())
+            {
+                foreach ($oRes as $v)
+                {
+                    $aServiceIds2[] = $v->service_id;           // 有分配订单的客服
+                }
+                $aDiff = array_diff($aServiceIds,$aServiceIds2);// $aServiceIds2元素 <= $aServiceIds元素 所以取出的是还未分配的客服
+                if(!empty($aDiff))
+                {
+                    $service_id = array_random($aDiff);         // 随机分配一个未分配订单的上班客服
+                }
+                else  $service_id = $aServiceIds2[0];           // 取订单数分配最少的第一个客服
+            }
+            else $service_id = array_random($aServiceIds);      // 随机分配一个上班的客服
         }
 
-        $order_id = date('YmdHis').mt_rand(10000,99999);  // 平台订单号2019080616074012345
+        $order_id = date('YmdHis').mt_rand(10000,99999);        // 平台订单号2019080616074012345
         $oWithdrawal = Withdrawal::firstOrCreate(['merchant_id' => $oMerchant->id,'merchant_order_id' => $merchant_order_id], [
             'order_id'      => $order_id,
             'bill_price'    => $aData['bill_price'],
@@ -102,6 +124,12 @@ class WithdrawalController extends ApiController
         ]);
         if($oWithdrawal->wasRecentlyCreated)    //订单创建成功
         {
+            // 推送消息给上班的客服
+            if ($service_id)
+            {
+                Gateway::$registerAddress = env('GETWAY_REGISTER_ADDRESS', '127.0.0.1:1238');
+                Gateway::sendToUid($service_id, json_encode($oWithdrawal));
+            }
             return response()->json(['status'=>10000,'message'=>'请求成功','flashid'=>$merchant_order_id]);
         }
         else
@@ -124,12 +152,13 @@ class WithdrawalController extends ApiController
             $this->apiResponse->error('登录超时!',401);
         }
 
-        $query = Withdrawal::where('service_id',$serviceId)->orWhere('holder',$serviceId);
+        $query = Withdrawal::select(['withdrawals.*','merchants.merchant_no'])->where('service_id',$serviceId)->where('status', '<=', Withdrawal::STATUS_HOLDING)
+                            ->orWhere('holder',$serviceId)->where('status', '<=', Withdrawal::STATUS_HOLDING);
         if($user_id){
             $query = $query->where('user_id',$user_id);
         }
 
-        $withdrawals = $query->orderBy('id', 'desc')->paginate($perPage);
+        $withdrawals = $query->join('merchants', 'merchant_id', 'merchants.id')->orderBy('withdrawals.id', 'desc')->paginate($perPage);
         return $this->apiResponse->paginator($withdrawals, WithdrawalResource::class);
     }
 
@@ -270,16 +299,15 @@ class WithdrawalController extends ApiController
 						'status'   => $status,
 						'off_time' => $now,
 					]);
-                // 重置已分配给当前客服的出款订单service_id => 0
+                // 重置已分配给当前客服的出款订单service_id => '0'
                 Withdrawal::where('service_id', $serviceId)->where('status', Withdrawal::STATUS_WAITING)->where('created_at', '>=', $todayStart)
                     ->update([
-                        'service_id' => 0,
+                        'service_id' => '0',
                         'updated_at' => $now,
                     ]);
             }
 			else {
 				// 上次记录是下班 或者 上次记录不存在
-				// 添加一条 service_manages 下班时间为空
                 $oWithdrawalServiceTime->fill([
 					'service_id' => $serviceId,
 					'status'     => $status,
@@ -314,12 +342,12 @@ class WithdrawalController extends ApiController
         $perPage = request('per_page',20);
         $user_id = request('user_id');
 
-        $query = Withdrawal::latest();
+        $query = Withdrawal::select(['withdrawals.*','merchants.merchant_no'])->latest();
         if($user_id){
             $query = $query->where('user_id',$user_id);
         }
 
-        $withdrawals = $query->paginate($perPage);
+        $withdrawals = $query->join('merchants', 'merchant_id', 'merchants.id')->paginate($perPage);
         return $this->apiResponse->paginator($withdrawals, WithdrawalResource::class);
     }
 
@@ -352,7 +380,11 @@ class WithdrawalController extends ApiController
             if(empty($service_id)) continue;
             $data[$k]['service_id'] = $service_id;
             $oServiceTime = WithdrawalServiceTime::where('service_id',$service_id)->where('status',1)->latest()->first(['on_time']);
-            $data[$k]['on_time'] = $oServiceTime->on_time;
+            if (is_object($oServiceTime))
+            {
+                $data[$k]['on_time'] = $oServiceTime->on_time;
+            }
+            else $data[$k]['on_time'] = '还未上班';
             $query = Withdrawal::select(DB::raw('status, count(*) as nums'))->where('service_id',$service_id);
             if (!empty($startTime))
             {

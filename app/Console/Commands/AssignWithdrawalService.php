@@ -6,6 +6,7 @@ use App\Models\Withdrawal;
 use App\Models\WithdrawalServiceTime;
 use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
 
 class AssignWithdrawalService extends Command
 {
@@ -39,7 +40,8 @@ class AssignWithdrawalService extends Command
      * @return mixed
      */
     public function handle()
-    {   //$uniqid = uniqid();echo "<pre/>";print_r( $uniqid.'===='.md5($uniqid.time()) );die;
+    {
+        //$uniqid = uniqid();echo "<pre/>";print_r( $uniqid.'===='.md5($uniqid.time()) );die;
         $now        = Carbon::now()->toDateTimeString();
         $todayStart = Carbon::today()->toDateTimeString();
         $onServiceIds = WithdrawalServiceTime::where('status', 1)->where('on_time', '>=', $todayStart)->get(['service_id']);
@@ -50,17 +52,57 @@ class AssignWithdrawalService extends Command
             {
                 $aServiceIds[] = $one->service_id;
             }
-            $oWithdrawals = Withdrawal::where('service_id', 0)->where('status', Withdrawal::STATUS_WAITING)->where('created_at', '>=', $todayStart)->get(['id']);
+            //有分配订单的客服
+            $oRes = Withdrawal::select(DB::raw('service_id, count(*) as nums'))
+                                        ->whereIn('service_id', $aServiceIds)
+                                        ->where('status', '<=',  Withdrawal::STATUS_HOLDING)
+                                        ->where('created_at', '>=', $todayStart)
+                                        ->groupBy('service_id')
+                                        ->orderBy('nums','ASC')
+                                        ->get();
+            if ($oRes->isNotEmpty())
+            {
+                foreach ($oRes as $v)
+                {
+                    $aServiceIds2[] = $v->service_id;           // 有分配订单的客服
+                }
+                $aDiff = array_diff($aServiceIds,$aServiceIds2);// $aServiceIds2元素 <= $aServiceIds元素 所以取出的是还未分配的客服
+                if(!empty($aDiff))
+                {
+                    $aServiceIds = array_merge($aDiff,$aServiceIds2);
+                }
+                else  $aServiceIds = $aServiceIds2;
+            }
+
+            $oWithdrawals = Withdrawal::where('service_id', '0')->where('status', Withdrawal::STATUS_WAITING)->where('created_at', '>=', $todayStart)->get(['id']);
             //如果有需要分配客服的订单
             if ($oWithdrawals->isNotEmpty())
             {
-                foreach ($oWithdrawals as $item)
+                //如果订单数<=上班的客服人数
+                $iWithdrawals = count($oWithdrawals);
+                $iServiceIds = count($aServiceIds);
+                if($iWithdrawals <= $iServiceIds)
                 {
-                    $service_id = array_random($aServiceIds); // 随机分配一个上班的客服
-                    Withdrawal::where('id', $item->id)->update([
+                    foreach ($oWithdrawals as $item)
+                    {
+                        $service_id = array_shift($aServiceIds);
+                        Withdrawal::where('id', $item->id)->update([
                             'service_id' => $service_id,
                             'updated_at' => $now,
                         ]);
+                    }
+                }
+                else //如果订单数>上班的客服人数
+                {
+                    foreach ($oWithdrawals as $k=>$item)
+                    {
+                        $j = ($k + $iServiceIds) % $iServiceIds;//循环取模
+                        $service_id = $aServiceIds[$j];
+                        Withdrawal::where('id', $item->id)->update([
+                            'service_id' => $service_id,
+                            'updated_at' => $now,
+                        ]);
+                    }
                 }
             }
             else
